@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # SPECTER - Device Location & Capture Tracker
 
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
@@ -1432,3 +1433,6 @@ For issues or questions, check:
 ---
 
 **Remember: Use responsibly and ethically. Unauthorized surveillance is illegal.**
+=======
+# specter
+>>>>>>> 4d95bb61e542901a8d32e343c98dd0780fecc81a
